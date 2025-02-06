@@ -5,9 +5,9 @@ const fs = require('fs');
 
 async function run() {
     try {
-        const freshSnapshot = core.getInput("fresh-shapshots")==='true';
-        const includeFuzzTests = core.getInput('include-fuzz-tests')==='true';
-        const includeNewContracts = core.getInput('include-new-contracts')==='true';
+        const freshSnapshot = core.getInput("fresh-shapshots") === 'true';
+        const includeFuzzTests = core.getInput('include-fuzz-tests') === 'true';
+        const includeNewContracts = core.getInput('include-new-contracts') === 'true';
         const token = process.env.GITHUB_TOKEN || core.getInput("token");
         const octokit = getOctokit(token);
         const repo = context.repo.repo;
@@ -37,7 +37,7 @@ async function run() {
             if (prSnapshot === null) {
                 throw new Error(`prSnapshot is null`);
             }
-    
+
             fs.writeFileSync('.gas-snapshot.pr', prSnapshot);
             core.endGroup()
 
@@ -85,14 +85,29 @@ async function getGitFileContent(octokit, owner, repo, ref, filePath) {
 }
 
 async function generateGasSnapshot(repoFullName, branchName, fileName) {
-    await exec.exec('git', ['fetch', `https://github.com/${repoFullName}`, `${branchName}`]);
-    await exec.exec('git', ['checkout', '-b', branchName, `FETCH_HEAD`]);
+    const isFork = repoFullName !== `${context.repo.owner}/${context.repo.repo}`;
+
+    core.info(`Fetching branch: ${branchName} from repo: ${repoFullName}`);
+
+    // First, ensure we're on a clean branch
+    await exec.exec('git', ['checkout', '-B', `temp-${branchName}`]);
+
+    if (isFork) {
+        // If it's a fork, add a new remote and fetch from it
+        await exec.exec('git', ['remote', 'add', 'fork', `https://github.com/${repoFullName}.git`], { ignoreReturnCode: true });
+        await exec.exec('git', ['fetch', 'fork', branchName]);
+        await exec.exec('git', ['reset', '--hard', `fork/${branchName}`]);
+    } else {
+        // If it's the same repo, fetch as usual
+        await exec.exec('git', ['fetch', 'origin', branchName]);
+        await exec.exec('git', ['reset', '--hard', `origin/${branchName}`]);
+    }
 
     const options = {
         ignoreReturnCode: true,
         silent: true
     };
-    await exec.exec('forge', ['snapshot', '--snap', fileName] , options);
+    await exec.exec('forge', ['snapshot', '--snap', fileName], options);
 }
 
 async function getDiffFileContent() {
@@ -113,7 +128,7 @@ async function getDiffFileContent() {
 
 function generateReport(diffSnapshot, genCommit, comCommit, includeFuzzTests, includeNewContracts) {
     if (!diffSnapshot || diffSnapshot.trim() === "") return "";  // Return if diffSnapshot is blank
-    
+
     const mainTests = [];
     const prTests = [];
 
@@ -162,28 +177,28 @@ function generateReport(diffSnapshot, genCommit, comCommit, includeFuzzTests, in
     ]));
 
 
-        const testData = uniqueTests.map(testName => {
-            const [contractName, simpleTestName] = testName.split(':');
-            const mainTest = mainTests.find(t => t.testName === testName) || { gasValue: '-' };
-            const prTest = prTests.find(t => t.testName === testName) || { gasValue: '-' };
-            const diff = (mainTest.gasValue !== '-' && prTest.gasValue !== '-') 
-                ? (parseInt(prTest.gasValue) - parseInt(mainTest.gasValue)) 
-                : '-';
-            
-            return {
-                contractName,
-                testName: simpleTestName,
-                mainGas: mainTest.gasValue,
-                prGas: prTest.gasValue,
-                diff
-            };
-        }).filter(entry => 
-            (includeNewContracts || entry.diff !== '-') &&  entry.diff !== 0); // Include new contracts or existing ones with valid gas values
-            
-        // sort testData for correct rowSpan in report
-        testData.sort((a, b) => a.contractName.localeCompare(b.contractName));
+    const testData = uniqueTests.map(testName => {
+        const [contractName, simpleTestName] = testName.split(':');
+        const mainTest = mainTests.find(t => t.testName === testName) || { gasValue: '-' };
+        const prTest = prTests.find(t => t.testName === testName) || { gasValue: '-' };
+        const diff = (mainTest.gasValue !== '-' && prTest.gasValue !== '-')
+            ? (parseInt(prTest.gasValue) - parseInt(mainTest.gasValue))
+            : '-';
 
-        let report = `
+        return {
+            contractName,
+            testName: simpleTestName,
+            mainGas: mainTest.gasValue,
+            prGas: prTest.gasValue,
+            diff
+        };
+    }).filter(entry =>
+        (includeNewContracts || entry.diff !== '-') && entry.diff !== 0); // Include new contracts or existing ones with valid gas values
+
+    // sort testData for correct rowSpan in report
+    testData.sort((a, b) => a.contractName.localeCompare(b.contractName));
+
+    let report = `
 ### Gas Snapshot Comparison Report
 
 > Generated at commit : ${genCommit}, Compared to commit : ${comCommit}
@@ -196,7 +211,7 @@ function generateReport(diffSnapshot, genCommit, comCommit, includeFuzzTests, in
         <th>PR Gas</th>
         <th>Diff</th>
     </tr>`;
-        
+
     let lastContractName = '';
 
     // Process each test entry to generate report rows
@@ -204,7 +219,7 @@ function generateReport(diffSnapshot, genCommit, comCommit, includeFuzzTests, in
         if (entry.contractName !== lastContractName) {
             // Calculate rowSpan for the current contract
             const rowSpan = testData.filter(t => t.contractName === entry.contractName).length;
-            
+
             report += `
     <tr>
         <td rowspan="${rowSpan}">${entry.contractName}</td>`;

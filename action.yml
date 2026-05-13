@@ -23,17 +23,22 @@ inputs:
     description: Whether to include fuzz tests in the report.
     default: 'false'
     required: false
-  fresh-shapshots: 
+  fresh-snapshots: 
     description: Generates a new snapshot if 'true', otherwise fetches the snapshot from the PR branch
     default: 'true'
     required: false
+  foundry-profile:
+    description: Optional FOUNDRY_PROFILE to run `forge snapshot` under (e.g. `post_osaka`, `post_cancun`).
+    default: 'default'
+    required: false
+
 
 outputs:
   markdown:
     description: The gas diff between the base gas report and the new gas report, specifically formatted for markdown display
   
 runs:
-  using: 'node20'
+  using: 'node24'
   main : dist/index.js
   
 branding:

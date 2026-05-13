@@ -8,6 +8,7 @@ async function run() {
         const freshSnapshot = core.getInput("fresh-shapshots") === 'true';
         const includeFuzzTests = core.getInput('include-fuzz-tests') === 'true';
         const includeNewContracts = core.getInput('include-new-contracts') === 'true';
+        const foundryProfile = core.getInput('foundry-profile');
         const token = process.env.GITHUB_TOKEN || core.getInput("token");
         const octokit = getOctokit(token);
         const repo = context.repo.repo;
@@ -84,11 +85,13 @@ async function getGitFileContent(octokit, owner, repo, ref, filePath) {
     }
 }
 
-async function generateGasSnapshot(repoFullName, branchName, fileName) {
+async function generateGasSnapshot(repoFullName, branchName, fileName, foundryProfile) {
     const isFork = repoFullName !== `${context.repo.owner}/${context.repo.repo}`;
 
     core.info(`Fetching branch: ${branchName} from repo: ${repoFullName}`);
-
+    if (foundryProfile) {
+        core.info(`Using FOUNDRY_PROFILE=${foundryProfile}`);
+    }
     // First, ensure we're on a clean branch
     await exec.exec('git', ['checkout', '-B', `temp-${branchName}`]);
 
@@ -105,7 +108,11 @@ async function generateGasSnapshot(repoFullName, branchName, fileName) {
 
     const options = {
         ignoreReturnCode: true,
-        silent: true
+        silent: true,
+        env: {
+            ...process.env,
+            ...(foundryProfile ? { FOUNDRY_PROFILE: foundryProfile } : {}),
+        },
     };
     await exec.exec('forge', ['snapshot', '--snap', fileName], options);
 }

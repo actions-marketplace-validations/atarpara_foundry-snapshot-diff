@@ -168,7 +168,7 @@ async function generateGasSnapshot(
       ? { FOUNDRY_PROFILE: foundryProfile }
       : {}),
   };
-
+  let stderr = "";
   const code = await exec.exec("forge", ["snapshot", "--snap", fileName], {
     env,
     ignoreReturnCode: true,

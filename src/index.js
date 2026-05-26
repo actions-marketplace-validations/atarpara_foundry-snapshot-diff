@@ -1,204 +1,295 @@
-const core = require('@actions/core');
-const exec = require('@actions/exec');
-const { context, getOctokit } = require('@actions/github');
-const fs = require('fs');
+const core = require("@actions/core");
+const exec = require("@actions/exec");
+const { context, getOctokit } = require("@actions/github");
+const fs = require("fs");
 
 async function run() {
-    try {
-        const freshSnapshot = core.getInput("fresh-shapshots") === 'true';
-        const includeFuzzTests = core.getInput('include-fuzz-tests') === 'true';
-        const includeNewContracts = core.getInput('include-new-contracts') === 'true';
-        const token = process.env.GITHUB_TOKEN || core.getInput("token");
-        const octokit = getOctokit(token);
-        const repo = context.repo.repo;
-        const owner = context.repo.owner;
+  try {
+    const freshSnapshot = core.getInput("fresh-snapshots") === "true";
+    const includeFuzzTests = core.getInput("include-fuzz-tests") === "true";
+    const includeNewContracts =
+      core.getInput("include-new-contracts") === "true";
+    const foundryProfile = core.getInput("foundry-profile");
 
-        const genCommit = context.payload.pull_request.head.sha;
-        const comCommit = context.payload.pull_request.base.sha;
-
-        const headRepoFullName = context.payload.pull_request.head.repo.full_name;
-        const headBranch = context.payload.pull_request.head.ref;
-
-        const baseRepoFullName = context.payload.pull_request.base.repo.full_name;
-        const baseBranch = context.payload.pull_request.base.ref;
-
-        if (freshSnapshot) {
-            core.startGroup(`Generating the .gas-snapshot file from "${headBranch}"`);
-            await generateGasSnapshot(headRepoFullName, headBranch, ".gas-snapshot.pr");
-            core.endGroup()
-
-            core.startGroup(`Generating the .gas-snapshot file from "${baseBranch}"`);
-            await generateGasSnapshot(baseRepoFullName, baseBranch, ".gas-snapshot.base");
-            core.endGroup()
-
-        } else {
-            core.startGroup(`Starting the reading .gas-snapshot file from "${baseBranch}"`);
-            const prSnapshot = await getGitFileContent(octokit, owner, repo, baseBranch, '.gas-snapshot');
-            if (prSnapshot === null) {
-                throw new Error(`prSnapshot is null`);
-            }
-
-            fs.writeFileSync('.gas-snapshot.pr', prSnapshot);
-            core.endGroup()
-
-            core.startGroup(`Starting the reading .gas-snapshot file from "${baseBranch}"`);
-            // Fetch .gas-snapshot file from the base branch
-            const baseSnapshot = await getGitFileContent(octokit, owner, repo, baseBranch, '.gas-snapshot');
-            if (baseSnapshot === null) {
-                throw new Error(`baseSnapshot is null`);
-            }
-            fs.writeFileSync('.gas-snapshot.base', baseSnapshot);
-            core.endGroup()
-        }
-
-        core.startGroup("Starting the diff of the gas snapshot.");
-
-        // Get the diff between the base and PR snapshots
-        const diffSnapshot = await getDiffFileContent();
-        core.endGroup();
-
-        // Generate the report
-        core.startGroup("Generating the report.")
-        const report = generateReport(diffSnapshot, genCommit, comCommit, includeFuzzTests, includeNewContracts);
-        core.info(`Genrated Report :\n "${report}"`)
-        core.setOutput("markdown", report);
-
-    } catch (error) {
-        core.setFailed(`Action failed with error: ${error.message}`);
+    const token = process.env.GITHUB_TOKEN || core.getInput("token");
+    if (!token) {
+      throw new Error(
+        'No GitHub token provided. Set GITHUB_TOKEN or the "token" input.'
+      );
     }
+    const octokit = getOctokit(token);
+
+    if (!context.payload.pull_request) {
+      throw new Error("This action only runs on pull_request events.");
+    }
+
+    const { owner, repo } = context.repo;
+    const pr = context.payload.pull_request;
+    const genCommit = pr.head.sha;
+    const comCommit = pr.base.sha;
+
+    const headRepoFullName = pr.head.repo.full_name;
+    const headBranch = pr.head.ref;
+    const headOwner = pr.head.repo.owner.login;
+    const headRepoName = pr.head.repo.name;
+
+    const baseRepoFullName = pr.base.repo.full_name;
+    const baseBranch = pr.base.ref;
+
+    if (freshSnapshot) {
+      await runGrouped(`Generating .gas-snapshot from "${headBranch}"`, () =>
+        generateGasSnapshot(
+          headRepoFullName,
+          headBranch,
+          ".gas-snapshot.pr",
+          foundryProfile
+        )
+      );
+      await runGrouped(`Generating .gas-snapshot from "${baseBranch}"`, () =>
+        generateGasSnapshot(
+          baseRepoFullName,
+          baseBranch,
+          ".gas-snapshot.base",
+          foundryProfile
+        )
+      );
+    } else {
+      await runGrouped(
+        `Reading .gas-snapshot from "${headBranch}"`,
+        async () => {
+          const snap = await getGitFileContent(
+            octokit,
+            headOwner,
+            headRepoName,
+            headBranch,
+            ".gas-snapshot"
+          );
+          fs.writeFileSync(".gas-snapshot.pr", snap);
+        }
+      );
+      await runGrouped(
+        `Reading .gas-snapshot from "${baseBranch}"`,
+        async () => {
+          const snap = await getGitFileContent(
+            octokit,
+            owner,
+            repo,
+            baseBranch,
+            ".gas-snapshot"
+          );
+          fs.writeFileSync(".gas-snapshot.base", snap);
+        }
+      );
+    }
+
+    const diffSnapshot = await runGrouped(
+      "Diffing gas snapshots",
+      getDiffFileContent
+    );
+
+    await runGrouped("Generating report", async () => {
+      const report = generateReport(
+        diffSnapshot,
+        genCommit,
+        comCommit,
+        includeFuzzTests,
+        includeNewContracts
+      );
+      core.info(`Generated report:\n${report}`);
+      core.setOutput("markdown", report);
+    });
+  } catch (error) {
+    core.setFailed(`Action failed: ${error.message}`);
+  }
+}
+
+async function runGrouped(name, fn) {
+  core.startGroup(name);
+  try {
+    return await fn();
+  } finally {
+    core.endGroup();
+  }
 }
 
 async function getGitFileContent(octokit, owner, repo, ref, filePath) {
-    try {
-        const response = await octokit.rest.repos.getContent({
-            owner,
-            repo,
-            path: filePath,
-            ref,
-        });
-        const fileContent = Buffer.from(response.data.content, 'base64').toString();
-        return fileContent;
-    } catch (err) {
-        core.setFailed(`Failed to get file content: ${err}`);
-        throw err;
-    }
+  const response = await octokit.rest.repos.getContent({
+    owner,
+    repo,
+    path: filePath,
+    ref,
+  });
+  if (Array.isArray(response.data)) {
+    throw new Error(
+      `Expected a file at ${filePath} on ${owner}/${repo}@${ref}, got a directory.`
+    );
+  }
+  if (!response.data || typeof response.data.content !== "string") {
+    throw new Error(`No content for ${filePath} on ${owner}/${repo}@${ref}.`);
+  }
+  return Buffer.from(response.data.content, "base64").toString();
 }
 
-async function generateGasSnapshot(repoFullName, branchName, fileName) {
-    const isFork = repoFullName !== `${context.repo.owner}/${context.repo.repo}`;
+async function generateGasSnapshot(
+  repoFullName,
+  branchName,
+  fileName,
+  foundryProfile
+) {
+  const isFork = repoFullName !== `${context.repo.owner}/${context.repo.repo}`;
 
-    core.info(`Fetching branch: ${branchName} from repo: ${repoFullName}`);
+  core.info(`Fetching branch: ${branchName} from repo: ${repoFullName}`);
+  if (foundryProfile) core.info(`Using FOUNDRY_PROFILE=${foundryProfile}`);
 
-    // First, ensure we're on a clean branch
-    await exec.exec('git', ['checkout', '-B', `temp-${branchName}`]);
+  await exec.exec("git", ["checkout", "-B", `temp-${branchName}`]);
 
-    if (isFork) {
-        // If it's a fork, add a new remote and fetch from it
-        await exec.exec('git', ['remote', 'add', 'fork', `https://github.com/${repoFullName}.git`], { ignoreReturnCode: true });
-        await exec.exec('git', ['fetch', 'fork', branchName]);
-        await exec.exec('git', ['reset', '--hard', `fork/${branchName}`]);
-    } else {
-        // If it's the same repo, fetch as usual
-        await exec.exec('git', ['fetch', 'origin', branchName]);
-        await exec.exec('git', ['reset', '--hard', `origin/${branchName}`]);
-    }
+  if (isFork) {
+    /// clean the remote/fork first then add into fork
+    await exec.exec("git", ["remote", "remove", "fork"], {
+      ignoreReturnCode: true,
+      silent: true,
+    });
+    await exec.exec("git", [
+      "remote",
+      "add",
+      "fork",
+      `https://github.com/${repoFullName}.git`,
+    ]);
+    await exec.exec("git", ["fetch", "fork", branchName]);
+    await exec.exec("git", ["reset", "--hard", `fork/${branchName}`]);
+  } else {
+    await exec.exec("git", ["fetch", "origin", branchName]);
+    await exec.exec("git", ["reset", "--hard", `origin/${branchName}`]);
+  }
 
-    const options = {
-        ignoreReturnCode: true,
-        silent: true
-    };
-    await exec.exec('forge', ['snapshot', '--snap', fileName], options);
+  const env = {
+    ...process.env,
+    ...(foundryProfile && foundryProfile !== "default"
+      ? { FOUNDRY_PROFILE: foundryProfile }
+      : {}),
+  };
+  let stderr = "";
+  const code = await exec.exec("forge", ["snapshot", "--snap", fileName], {
+    env,
+    ignoreReturnCode: true,
+    silent: true,
+    listeners: {
+      stderr: (data) => {
+        stderr += data.toString();
+      },
+    },
+  });
+  if (
+    code !== 0 ||
+    !fs.existsSync(fileName) ||
+    fs.statSync(fileName).size === 0
+  ) {
+    throw new Error(
+      `forge snapshot failed (exit ${code}) on branch=${branchName}` +
+        `${foundryProfile ? `, profile=${foundryProfile}` : ""}.`
+    );
+  }
 }
 
 async function getDiffFileContent() {
-    let output = '';
-    const options = {
-        listeners: {
-            stdout: (data) => {
-                core.info('diff stdout:', data.toString());
-                output += data.toString();
-            },
+  let output = "";
+  let stderr = "";
+  const code = await exec.exec(
+    "diff",
+    [".gas-snapshot.base", ".gas-snapshot.pr"],
+    {
+      ignoreReturnCode: true,
+      silent: true,
+      listeners: {
+        stdout: (data) => {
+          const s = data.toString();
+          core.info(`diff stdout: ${s.trimEnd()}`);
+          output += s;
         },
-        ignoreReturnCode: true,
-        silent: true
-    };
-    await exec.exec('diff', ['.gas-snapshot.base', '.gas-snapshot.pr'], options);
-    return output;
+        stderr: (data) => {
+          stderr += data.toString();
+        },
+      },
+    }
+  );
+  // diff exit codes: 0 = identical, 1 = differs (normal), >=2 = real error
+  if (code > 1) {
+    throw new Error(`diff failed (exit ${code}): ${stderr.trim()}`);
+  }
+  return output;
 }
 
-function generateReport(diffSnapshot, genCommit, comCommit, includeFuzzTests, includeNewContracts) {
-    if (!diffSnapshot || diffSnapshot.trim() === "") return "";  // Return if diffSnapshot is blank
+function generateReport(
+  diffSnapshot,
+  genCommit,
+  comCommit,
+  includeFuzzTests,
+  includeNewContracts
+) {
+  if (!diffSnapshot || diffSnapshot.trim() === "") return "";
 
-    const mainTests = [];
-    const prTests = [];
+  // Bug fix: original built two arrays then did .find() per unique test, giving O(n^2) lookups.
+  // Maps are O(1) per lookup.
+  const mainByTest = new Map();
+  const prByTest = new Map();
 
-    const lines = diffSnapshot.split('\n').filter(line => line.trim()); // Ensure non-empty lines
+  for (const rawLine of diffSnapshot.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (!line.startsWith("<") && !line.startsWith(">")) continue;
 
-    if (lines.length === 0) return "";  // Return if no valid lines are found
+    const isFuzzTest = line.includes("runs:");
+    if (!includeFuzzTests && isFuzzTest) continue;
 
-    lines.forEach(line => {
-        if (line.startsWith('<') || line.startsWith('>')) {
-            let testName;
-            let gasValue;
-            const isFuzzTest = line.includes('runs:');
+    const testName = line.split(" (")[0].substring(2);
+    const sep = isFuzzTest || !line.includes("gas:") ? "~: " : "gas: ";
+    const gasValue = line.split(sep)[1]?.replace(")", "").trim();
+    if (!testName || !gasValue) continue;
 
-            if (includeFuzzTests) {
-                // Process both fuzz and non-fuzz tests
-                if (isFuzzTest || !line.includes('gas:')) {
-                    testName = line.split(' (')[0].substring(2);
-                    gasValue = line.split('~: ')[1]?.replace(')', '').trim();  // Use optional chaining to avoid error
-                } else {
-                    testName = line.split(' (')[0].substring(2);
-                    gasValue = line.split('gas: ')[1]?.replace(')', '').trim();  // Use optional chaining to avoid error
-                }
-            } else {
-                // Only process non-fuzz tests
-                if (!isFuzzTest) {
-                    testName = line.split(' (')[0].substring(2);
-                    gasValue = line.split('gas: ')[1]?.replace(')', '').trim();  // Use optional chaining to avoid error
-                }
-            }
+    (line.startsWith("<") ? mainByTest : prByTest).set(testName, gasValue);
+  }
 
-            if (testName && gasValue) {
-                if (line.startsWith('<')) {
-                    mainTests.push({ testName, gasValue });
-                } else if (line.startsWith('>')) {
-                    prTests.push({ testName, gasValue });
-                }
-            }
-        }
+  if (mainByTest.size === 0 && prByTest.size === 0) return "";
+
+  const allNames = new Set([...mainByTest.keys(), ...prByTest.keys()]);
+
+  const testData = [];
+  for (const fullName of allNames) {
+    const [contractName, simpleTestName] = fullName.split(":");
+    const mainGas = mainByTest.get(fullName) ?? "-";
+    const prGas = prByTest.get(fullName) ?? "-";
+    // Bug fix: parseInt without radix can mis-parse strings like "0x..." or "07".
+    const diff =
+      mainGas !== "-" && prGas !== "-"
+        ? parseInt(prGas, 10) - parseInt(mainGas, 10)
+        : "-";
+
+    const isNew = diff === "-";
+    if (diff === 0) continue;
+    if (!includeNewContracts && isNew) continue;
+
+    testData.push({
+      contractName,
+      testName: simpleTestName,
+      mainGas,
+      prGas,
+      diff,
     });
+  }
 
-    if (mainTests.length === 0 && prTests.length === 0) return ""; // Return if no tests are found
+  if (testData.length === 0) return "";
 
-    const uniqueTests = Array.from(new Set([
-        ...mainTests.map(t => t.testName),
-        ...prTests.map(t => t.testName)
-    ]));
+  testData.sort((a, b) => a.contractName.localeCompare(b.contractName));
 
+  const contractCounts = new Map();
+  for (const e of testData) {
+    contractCounts.set(
+      e.contractName,
+      (contractCounts.get(e.contractName) ?? 0) + 1
+    );
+  }
 
-    const testData = uniqueTests.map(testName => {
-        const [contractName, simpleTestName] = testName.split(':');
-        const mainTest = mainTests.find(t => t.testName === testName) || { gasValue: '-' };
-        const prTest = prTests.find(t => t.testName === testName) || { gasValue: '-' };
-        const diff = (mainTest.gasValue !== '-' && prTest.gasValue !== '-')
-            ? (parseInt(prTest.gasValue) - parseInt(mainTest.gasValue))
-            : '-';
-
-        return {
-            contractName,
-            testName: simpleTestName,
-            mainGas: mainTest.gasValue,
-            prGas: prTest.gasValue,
-            diff
-        };
-    }).filter(entry =>
-        (includeNewContracts || entry.diff !== '-') && entry.diff !== 0); // Include new contracts or existing ones with valid gas values
-
-    // sort testData for correct rowSpan in report
-    testData.sort((a, b) => a.contractName.localeCompare(b.contractName));
-
-    let report = `
+  let report = `
 ### Gas Snapshot Comparison Report
 
 > Generated at commit : ${genCommit}, Compared to commit : ${comCommit}
@@ -212,36 +303,31 @@ function generateReport(diffSnapshot, genCommit, comCommit, includeFuzzTests, in
         <th>Diff</th>
     </tr>`;
 
-    let lastContractName = '';
-
-    // Process each test entry to generate report rows
-    testData.forEach(entry => {
-        if (entry.contractName !== lastContractName) {
-            // Calculate rowSpan for the current contract
-            const rowSpan = testData.filter(t => t.contractName === entry.contractName).length;
-
-            report += `
+  let lastContractName = "";
+  for (const entry of testData) {
+    if (entry.contractName !== lastContractName) {
+      report += `
     <tr>
-        <td rowspan="${rowSpan}">${entry.contractName}</td>`;
-        } else {
-            report += `
+        <td rowspan="${contractCounts.get(entry.contractName)}">${
+        entry.contractName
+      }</td>`;
+    } else {
+      report += `
     <tr>`;
-        }
-
-        report += `
+    }
+    report += `
         <td>${entry.testName}</td>
         <td>${entry.mainGas}</td>
         <td>${entry.prGas}</td>
         <td>${entry.diff}</td>
     </tr>`;
+    lastContractName = entry.contractName;
+  }
 
-        lastContractName = entry.contractName;
-    });
-
-    report += `
+  report += `
 </table>
 `;
-    return report;
+  return report;
 }
 
 run();

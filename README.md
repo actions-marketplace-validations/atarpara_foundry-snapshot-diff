@@ -41,18 +41,18 @@ jobs:
     permissions: write-all
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@v1.8.0
         with:
-          version: nightly
+          version: stable
 
       - name: Install Dependencies
         run: forge install
 
       - name: Generate gas diff
-        uses: atarpara/foundry-snapshot-diff@v0.8
+        uses: atarpara/foundry-snapshot-diff@v0.9
         with:
           # Optionally configure to run only for changes in specific files. For example:
           # token: ${{ secrets.GITHUB_TOKEN }}
@@ -61,6 +61,7 @@ jobs:
           # include-fuzz-tests: true
           # fresh-snapshots: true
           # include-new-contracts: true
+          # foundry-profile : your_foundry_profile
         id : gas_diff
       
       - name: Add gas diff to sticky comment
